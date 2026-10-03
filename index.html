@@ -1,0 +1,719 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#0b0d10">
+<title>T452 Strap Viewer</title>
+<!--
+  T452 chest-strap live viewer.
+  Open in the Bluefy browser on iPhone (Safari has no Web Bluetooth), or in
+  desktop Chrome/Edge. Single file, no external libraries, so it keeps
+  working without a data signal once loaded.
+
+  Must match the firmware (include/config.h, include/ble_service.h):
+    SensorPacket (notify, 7 bytes, little-endian):
+      uint32 timestampMs | uint8 heartRateBpm | uint8 cadenceSpm | uint8 alertMask
+    ConfigPacket (write, 12 bytes, little-endian):
+      float32 hrThresh | float32 cadenceLowThresh | float32 cadenceHighThresh
+    alertMask bits: 0 = high HR, 1 = low cadence, 2 = high cadence
+-->
+<style>
+  :root {
+    --bg: #0b0d10;
+    --panel: #161a20;
+    --text: #f2f4f7;
+    --muted: #8b95a3;
+    --line: #262c35;
+    --hr: #ff5a5f;
+    --cad: #3fb8ff;
+    --ok: #3ddc84;
+    --warn: #ffb020;
+    --alert: #ff3b30;
+    --on-alert: #ffffff;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f3f4f6;
+      --panel: #ffffff;
+      --text: #0b0d10;
+      --muted: #5b6573;
+      --line: #dde1e6;
+      --hr: #d92d3a;
+      --cad: #0a7fc2;
+      --ok: #1a9e55;
+      --warn: #b26b00;
+      --alert: #d70015;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    padding: max(12px, env(safe-area-inset-top)) 16px max(24px, env(safe-area-inset-bottom));
+    max-width: 640px;
+    margin: 0 auto;
+    -webkit-tap-highlight-color: transparent;
+  }
+  header { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+  header h1 { font-size: 17px; margin: 0; flex: 1; font-weight: 650; }
+  .pill {
+    font-size: 13px; padding: 4px 10px; border-radius: 999px;
+    background: var(--panel); border: 1px solid var(--line); color: var(--muted);
+    white-space: nowrap;
+  }
+  .pill.ok { color: var(--ok); border-color: var(--ok); }
+  .pill.warn { color: var(--warn); border-color: var(--warn); }
+  .pill.err { color: var(--alert); border-color: var(--alert); }
+  button {
+    font: inherit; font-weight: 600; font-size: 15px;
+    border: none; border-radius: 12px; padding: 12px 16px;
+    background: var(--cad); color: #fff; cursor: pointer;
+  }
+  button.secondary { background: var(--panel); color: var(--text); border: 1px solid var(--line); }
+  button:disabled { opacity: .5; }
+
+  #banner {
+    display: none; border-radius: 14px; padding: 14px 16px; margin-bottom: 12px;
+    background: var(--alert); color: var(--on-alert);
+    font-weight: 800; font-size: 22px; letter-spacing: .02em; text-align: center;
+    animation: pulse 1s ease-in-out infinite alternate;
+  }
+  #banner.show { display: block; }
+  #banner div + div { margin-top: 4px; }
+  @keyframes pulse { from { opacity: 1; } to { opacity: .7; } }
+
+  .tiles { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .tile {
+    background: var(--panel); border: 2px solid var(--line); border-radius: 18px;
+    padding: 12px 14px 14px; min-width: 0;
+  }
+  .tile .label { font-size: 13px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .06em; }
+  .tile .value {
+    font-size: clamp(56px, 19vw, 96px); font-weight: 800; line-height: 1;
+    font-variant-numeric: tabular-nums; margin: 6px 0 4px;
+  }
+  .tile .unit { font-size: 14px; color: var(--muted); }
+  .tile .sub { font-size: 13px; color: var(--muted); margin-top: 6px; min-height: 1.2em; }
+  .tile.hr .value { color: var(--hr); }
+  .tile.cad .value { color: var(--cad); }
+  .tile.warn { border-color: var(--warn); }
+  .tile.alert { border-color: var(--alert); background: color-mix(in srgb, var(--alert) 14%, var(--panel)); }
+  .tile.nodata .value { color: var(--muted); }
+
+  .stats {
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px;
+    margin: 10px 0; background: var(--panel); border: 1px solid var(--line);
+    border-radius: 14px; padding: 10px 6px; text-align: center;
+  }
+  .stats b { display: block; font-size: 19px; font-variant-numeric: tabular-nums; }
+  .stats span { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
+
+  .chart {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
+    padding: 8px 10px 6px; margin-bottom: 10px;
+  }
+  .chart .head { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  .chart canvas { width: 100%; height: 130px; display: block; }
+
+  .actions { display: flex; gap: 8px; margin: 12px 0; }
+  .actions button { flex: 1; }
+
+  details {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
+    padding: 4px 14px; margin-bottom: 10px;
+  }
+  summary { padding: 10px 0; font-weight: 650; cursor: pointer; }
+  .field { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 0; border-top: 1px solid var(--line); }
+  .field label { font-size: 15px; }
+  .field small { display: block; color: var(--muted); font-size: 12px; }
+  .field input[type=number] {
+    width: 88px; font: inherit; font-size: 17px; padding: 8px; border-radius: 10px;
+    border: 1px solid var(--line); background: var(--bg); color: var(--text); text-align: right;
+  }
+  .field input[type=checkbox] { width: 24px; height: 24px; accent-color: var(--cad); }
+  #configMsg { font-size: 13px; min-height: 1.2em; margin: 6px 0 10px; }
+  #configMsg.err { color: var(--alert); }
+  #configMsg.ok { color: var(--ok); }
+  .note { font-size: 12px; color: var(--muted); line-height: 1.5; }
+</style>
+</head>
+<body>
+<header>
+  <h1>T452 Chest Strap</h1>
+  <span id="status" class="pill">Not connected</span>
+</header>
+
+<div id="banner" role="alert" aria-live="assertive"></div>
+
+<div class="tiles">
+  <div class="tile hr nodata" id="hrTile">
+    <div class="label">Heart rate</div>
+    <div class="value" id="hrValue">--</div>
+    <div class="unit">bpm</div>
+    <div class="sub" id="hrSub"></div>
+  </div>
+  <div class="tile cad nodata" id="cadTile">
+    <div class="label">Cadence</div>
+    <div class="value" id="cadValue">--</div>
+    <div class="unit">steps/min</div>
+    <div class="sub" id="cadSub"></div>
+  </div>
+</div>
+
+<div class="stats">
+  <div><b id="stTime">0:00</b><span>Time</span></div>
+  <div><b id="stHrAvg">--</b><span>Avg HR</span></div>
+  <div><b id="stHrMax">--</b><span>Max HR</span></div>
+  <div><b id="stCadAvg">--</b><span>Avg cad</span></div>
+</div>
+
+<div class="actions">
+  <button id="connectBtn">Connect</button>
+  <button id="disconnectBtn" class="secondary" hidden>Disconnect</button>
+</div>
+
+<div class="chart">
+  <div class="head"><span>Heart rate — last 5 min</span><span id="hrRange"></span></div>
+  <canvas id="hrChart"></canvas>
+</div>
+<div class="chart">
+  <div class="head"><span>Cadence — last 5 min</span><span id="cadRange"></span></div>
+  <canvas id="cadChart"></canvas>
+</div>
+
+<details id="settings">
+  <summary>Alert thresholds</summary>
+  <div class="field">
+    <label for="thHr">High heart rate<small>alert above, bpm</small></label>
+    <input id="thHr" type="number" inputmode="numeric" min="100" max="220" step="1">
+  </div>
+  <div class="field">
+    <label for="thLow">Low cadence<small>warn below, spm</small></label>
+    <input id="thLow" type="number" inputmode="numeric" min="100" max="200" step="1">
+  </div>
+  <div class="field">
+    <label for="thHigh">High cadence<small>warn above, spm (max 215)</small></label>
+    <input id="thHigh" type="number" inputmode="numeric" min="150" max="215" step="1">
+  </div>
+  <button id="saveThresholds" style="width:100%;margin-top:6px">Save &amp; send to strap</button>
+  <div id="configMsg"></div>
+</details>
+
+<details>
+  <summary>Options</summary>
+  <div class="field">
+    <label for="optVoice">Voice alerts<small>speaks new alerts and disconnects</small></label>
+    <input id="optVoice" type="checkbox">
+  </div>
+  <div class="field">
+    <label for="optBeep">Beep on alert</label>
+    <input id="optBeep" type="checkbox">
+  </div>
+  <div class="field">
+    <label for="optDemo">Demo mode<small>simulated data, no strap needed</small></label>
+    <input id="optDemo" type="checkbox">
+  </div>
+  <div class="field" style="padding-bottom:12px">
+    <label>Session data<small id="sampleCount">0 samples</small></label>
+    <button id="exportBtn" class="secondary">Export CSV</button>
+  </div>
+</details>
+
+<p class="note">
+  Keep this page open on screen while running — iOS pauses Bluetooth for
+  browser pages in the background or when the phone locks. Set
+  Settings › Display &amp; Brightness › Auto-Lock to “Never” for the run.
+  The strap still buzzes for alerts even if this page disconnects.
+</p>
+
+<script>
+'use strict';
+
+// ---- Must match firmware config.h / ble_service.h / fusion.h ----
+const SERVICE_UUID = '19b10000-e8f2-537e-4f6c-d104768a1214';
+const SENSOR_UUID  = '19b10001-e8f2-537e-4f6c-d104768a1214';
+const CONFIG_UUID  = '19b10003-e8f2-537e-4f6c-d104768a1214';
+const DEVICE_NAME  = 'T452-ChestStrap';
+const BIT_HR = 1, BIT_LOW_CAD = 2, BIT_HIGH_CAD = 4;
+const DEFAULTS = { hr: 170, low: 160, high: 200 };
+// Firmware hold times (config.h) -- only used by demo mode.
+const HOLD_HR_S = 5, HOLD_CAD_S = 10;
+
+const CHART_WINDOW_MS = 5 * 60 * 1000;
+const STALE_MS = 3500;            // no packet for this long while connected = "no data"
+const REMIND_EVERY_MS = 60000;    // repeat a spoken alert this often while still active
+
+const ALERT_TEXT = {
+  [BIT_HR]:       { banner: 'HIGH HEART RATE',  speak: 'High heart rate' },
+  [BIT_LOW_CAD]:  { banner: 'LOW CADENCE',      speak: 'Cadence low' },
+  [BIT_HIGH_CAD]: { banner: 'HIGH CADENCE',     speak: 'Cadence high' },
+};
+
+const $ = (id) => document.getElementById(id);
+
+// ---- Persistent settings (per-phone convenience only) ----
+function load(key, fallback) {
+  try { const v = localStorage.getItem('t452.' + key); return v === null ? fallback : JSON.parse(v); }
+  catch { return fallback; }
+}
+function save(key, value) {
+  try { localStorage.setItem('t452.' + key, JSON.stringify(value)); } catch {}
+}
+
+let thresholds = load('thresholds', DEFAULTS);
+const opts = { voice: load('voice', true), beep: load('beep', true) };
+
+// ---- Session state ----
+let samples = [];          // { t: phone ms, deviceMs, hr, cad, mask }
+let sessionStart = null;
+let lastPacketAt = 0;
+let prevMask = 0;
+const lastSpokenAt = {};
+let connected = false;
+
+// ---- BLE state ----
+let device = null;
+let configChar = null;
+let userDisconnected = false;
+let reconnectTimer = null;
+
+// =====================================================================
+// UI
+// =====================================================================
+function setStatus(text, kind) {
+  const el = $('status');
+  el.textContent = text;
+  el.className = 'pill' + (kind ? ' ' + kind : '');
+}
+
+function fmtDuration(ms) {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  return h ? `${h}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`
+           : `${m}:${String(sec).padStart(2, '0')}`;
+}
+
+function renderLatest() {
+  const last = samples[samples.length - 1];
+  const stale = !last || (Date.now() - lastPacketAt > STALE_MS);
+  const mask = stale ? 0 : last.mask;
+
+  // Heart rate tile
+  const hrTile = $('hrTile');
+  if (stale || last.hr === 0) {
+    $('hrValue').textContent = '--';
+    $('hrSub').textContent = stale ? (connected ? 'waiting for data' : '') : 'no reading — check electrodes';
+    hrTile.className = 'tile hr nodata';
+  } else {
+    $('hrValue').textContent = last.hr;
+    $('hrSub').textContent = `alert above ${thresholds.hr}`;
+    hrTile.className = 'tile hr' +
+      ((mask & BIT_HR) ? ' alert' : (last.hr > thresholds.hr - 10 ? ' warn' : ''));
+  }
+
+  // Cadence tile
+  const cadTile = $('cadTile');
+  if (stale || last.cad === 0) {
+    $('cadValue').textContent = '--';
+    $('cadSub').textContent = stale ? (connected ? 'waiting for data' : '') : 'not running';
+    cadTile.className = 'tile cad nodata';
+  } else {
+    $('cadValue').textContent = last.cad;
+    $('cadSub').textContent = `target ${thresholds.low}–${thresholds.high}`;
+    const out = last.cad < thresholds.low || last.cad > thresholds.high;
+    cadTile.className = 'tile cad' +
+      ((mask & (BIT_LOW_CAD | BIT_HIGH_CAD)) ? ' alert' : (out ? ' warn' : ''));
+  }
+
+  // Banner
+  const banner = $('banner');
+  const lines = Object.keys(ALERT_TEXT).filter((b) => mask & b).map((b) => ALERT_TEXT[b].banner);
+  banner.innerHTML = lines.map((l) => `<div>${l}</div>`).join('');
+  banner.classList.toggle('show', lines.length > 0);
+}
+
+function renderStats() {
+  $('stTime').textContent = sessionStart ? fmtDuration(Date.now() - sessionStart) : '0:00';
+  const hrs = samples.filter((s) => s.hr > 0).map((s) => s.hr);
+  const cads = samples.filter((s) => s.cad > 0).map((s) => s.cad);
+  const avg = (a) => a.length ? Math.round(a.reduce((x, y) => x + y, 0) / a.length) : '--';
+  $('stHrAvg').textContent = avg(hrs);
+  $('stHrMax').textContent = hrs.length ? Math.max(...hrs) : '--';
+  $('stCadAvg').textContent = avg(cads);
+  $('sampleCount').textContent = `${samples.length} samples`;
+}
+
+// ---- Charts (plain canvas, no library) ----
+function cssVar(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+
+function drawChart(canvas, key, color, yMin, yMax, lines) {
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  if (canvas.width !== w * dpr || canvas.height !== h * dpr) {
+    canvas.width = w * dpr; canvas.height = h * dpr;
+  }
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+
+  const padL = 30, padR = 4, padT = 6, padB = 6;
+  const now = Date.now();
+  // Early in a run, stretch the data across the full width instead of
+  // squeezing it into the right-hand edge of an empty 5-minute window.
+  const sinceFirst = samples.length ? now - samples[0].t : 0;
+  const windowMs = Math.min(CHART_WINDOW_MS, Math.max(60000, sinceFirst));
+  const x = (t) => padL + (w - padL - padR) * (1 - (now - t) / windowMs);
+  const y = (v) => padT + (h - padT - padB) * (1 - (Math.min(Math.max(v, yMin), yMax) - yMin) / (yMax - yMin));
+
+  // Grid + axis labels
+  ctx.font = '11px -apple-system, sans-serif';
+  ctx.fillStyle = cssVar('--muted');
+  ctx.strokeStyle = cssVar('--line');
+  ctx.lineWidth = 1;
+  ctx.textAlign = 'right';
+  ctx.textBaseline = 'middle';
+  const step = (yMax - yMin) / 4;
+  for (let i = 0; i <= 4; i++) {
+    const v = yMin + step * i;
+    ctx.beginPath(); ctx.moveTo(padL, y(v)); ctx.lineTo(w - padR, y(v)); ctx.stroke();
+    ctx.fillText(Math.round(v), padL - 5, y(v));
+  }
+
+  // Threshold lines
+  ctx.setLineDash([5, 4]);
+  for (const { value, colorVar } of lines) {
+    ctx.strokeStyle = cssVar(colorVar);
+    ctx.beginPath(); ctx.moveTo(padL, y(value)); ctx.lineTo(w - padR, y(value)); ctx.stroke();
+  }
+  ctx.setLineDash([]);
+
+  // Data line -- breaks wherever there's no reading (0) or a gap in packets.
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 2.5;
+  ctx.lineJoin = 'round';
+  ctx.beginPath();
+  let pen = false, prevT = 0;
+  for (const s of samples) {
+    if (now - s.t > windowMs) continue;
+    const v = s[key];
+    if (v === 0 || (pen && s.t - prevT > STALE_MS)) { pen = false; }
+    if (v !== 0) {
+      if (pen) ctx.lineTo(x(s.t), y(v)); else ctx.moveTo(x(s.t), y(v));
+      pen = true;
+    }
+    prevT = s.t;
+  }
+  ctx.stroke();
+}
+
+function renderCharts() {
+  drawChart($('hrChart'), 'hr', cssVar('--hr'), 40, 200,
+    [{ value: thresholds.hr, colorVar: '--alert' }]);
+  drawChart($('cadChart'), 'cad', cssVar('--cad'), 120, 220,
+    [{ value: thresholds.low, colorVar: '--warn' }, { value: thresholds.high, colorVar: '--warn' }]);
+}
+
+function renderAll() { renderLatest(); renderStats(); renderCharts(); }
+
+// =====================================================================
+// Alerts: voice + beep (iOS has no vibration API for web pages)
+// =====================================================================
+let audioCtx = null;
+function unlockAudio() {
+  // iOS only allows audio/speech after a user tap, so prime both here.
+  try {
+    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    audioCtx.resume();
+  } catch {}
+  try { speechSynthesis.speak(new SpeechSynthesisUtterance('')); } catch {}
+}
+
+function beep() {
+  if (!opts.beep || !audioCtx) return;
+  const t0 = audioCtx.currentTime;
+  for (let i = 0; i < 2; i++) {
+    const osc = audioCtx.createOscillator(), gain = audioCtx.createGain();
+    osc.frequency.value = 880;
+    gain.gain.setValueAtTime(0.0001, t0 + i * 0.25);
+    gain.gain.exponentialRampToValueAtTime(0.4, t0 + i * 0.25 + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t0 + i * 0.25 + 0.18);
+    osc.connect(gain).connect(audioCtx.destination);
+    osc.start(t0 + i * 0.25); osc.stop(t0 + i * 0.25 + 0.2);
+  }
+}
+
+function speak(text) {
+  if (!opts.voice || !('speechSynthesis' in window)) return;
+  try { speechSynthesis.speak(new SpeechSynthesisUtterance(text)); } catch {}
+}
+
+function handleAlerts(mask) {
+  const now = Date.now();
+  const newBits = mask & ~prevMask;
+  for (const b of Object.keys(ALERT_TEXT).map(Number)) {
+    if (!(mask & b)) continue;
+    const isNew = newBits & b;
+    if (isNew || now - (lastSpokenAt[b] || 0) > REMIND_EVERY_MS) {
+      if (isNew) beep();
+      speak(ALERT_TEXT[b].speak);
+      lastSpokenAt[b] = now;
+    }
+  }
+  prevMask = mask;
+}
+
+// =====================================================================
+// Incoming data
+// =====================================================================
+function handleSample(s) {
+  const now = Date.now();
+  if (!sessionStart) sessionStart = now;
+  lastPacketAt = now;
+  samples.push({ t: now, ...s });
+  handleAlerts(s.mask);
+  renderAll();
+}
+
+function onSensorNotify(event) {
+  const v = event.target.value;   // DataView
+  if (v.byteLength < 7) return;
+  handleSample({
+    deviceMs: v.getUint32(0, true),
+    hr: v.getUint8(4),
+    cad: v.getUint8(5),
+    mask: v.getUint8(6),
+  });
+}
+
+// =====================================================================
+// Bluetooth
+// =====================================================================
+async function connect() {
+  unlockAudio();
+  if (!navigator.bluetooth) {
+    setStatus('No Bluetooth', 'err');
+    alert('This browser can’t use Bluetooth. On iPhone, open this page in the Bluefy app. On a computer, use Chrome or Edge.');
+    return;
+  }
+  if ($('optDemo').checked) { $('optDemo').checked = false; stopDemo(); }
+  try {
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ services: [SERVICE_UUID] }, { name: DEVICE_NAME }],
+      optionalServices: [SERVICE_UUID],
+    });
+  } catch (err) {
+    if (err.name !== 'NotFoundError') setStatus('Error', 'err');   // NotFoundError = user cancelled
+    return;
+  }
+  device.addEventListener('gattserverdisconnected', onDisconnected);
+  userDisconnected = false;
+  $('connectBtn').hidden = true;
+  $('disconnectBtn').hidden = false;   // also lets the user stop a reconnect loop
+  await connectGatt();
+}
+
+async function connectGatt() {
+  clearTimeout(reconnectTimer);
+  setStatus('Connecting…', 'warn');
+  try {
+    const server = await device.gatt.connect();
+    const service = await server.getPrimaryService(SERVICE_UUID);
+    const sensor = await service.getCharacteristic(SENSOR_UUID);
+    configChar = await service.getCharacteristic(CONFIG_UUID);
+    if (!sensor._t452Listening) {
+      sensor.addEventListener('characteristicvaluechanged', onSensorNotify);
+      sensor._t452Listening = true;
+    }
+    await sensor.startNotifications();
+    connected = true;
+    setStatus('Connected', 'ok');
+    requestWakeLock();
+    // The strap forgets app-set thresholds on reboot, so always re-send ours.
+    await sendThresholds(true);
+  } catch (err) {
+    console.error(err);
+    connected = false;
+    scheduleReconnect();
+  }
+}
+
+let reconnectDelay = 1000;
+function scheduleReconnect() {
+  if (userDisconnected || !device) return;
+  setStatus('Reconnecting…', 'warn');
+  clearTimeout(reconnectTimer);
+  reconnectTimer = setTimeout(connectGatt, reconnectDelay);
+  reconnectDelay = Math.min(reconnectDelay * 2, 10000);
+}
+
+function onDisconnected() {
+  connected = false;
+  configChar = null;
+  renderLatest();
+  if (userDisconnected) {
+    setStatus('Not connected');
+    return;
+  }
+  speak('Strap disconnected');
+  scheduleReconnect();
+}
+
+function disconnect() {
+  userDisconnected = true;
+  clearTimeout(reconnectTimer);
+  if (device && device.gatt.connected) device.gatt.disconnect();
+  connected = false;
+  setStatus('Not connected');
+  $('connectBtn').hidden = false;
+  $('disconnectBtn').hidden = true;
+  renderLatest();
+}
+
+// Reset the reconnect backoff once data is flowing again.
+setInterval(() => { if (connected) reconnectDelay = 1000; }, 5000);
+
+// =====================================================================
+// Thresholds
+// =====================================================================
+function readThresholdInputs() {
+  const hr = Number($('thHr').value), low = Number($('thLow').value), high = Number($('thHigh').value);
+  if (![hr, low, high].every(Number.isFinite)) return { error: 'Enter a number in every box.' };
+  if (hr < 100 || hr > 220) return { error: 'Heart rate threshold must be 100–220 bpm.' };
+  if (low < 100 || low > 200) return { error: 'Low cadence must be 100–200 spm.' };
+  if (high < 150 || high > 215) return { error: 'High cadence must be 150–215 spm (the strap can’t measure above ~215).' };
+  if (low >= high) return { error: 'Low cadence must be below high cadence.' };
+  return { hr, low, high };
+}
+
+async function sendThresholds(quiet) {
+  const msg = $('configMsg');
+  if (!configChar) {
+    if (!quiet) { msg.textContent = 'Saved on this phone — will be sent when the strap connects.'; msg.className = 'ok'; }
+    return;
+  }
+  const buf = new ArrayBuffer(12);
+  const dv = new DataView(buf);
+  dv.setFloat32(0, thresholds.hr, true);
+  dv.setFloat32(4, thresholds.low, true);
+  dv.setFloat32(8, thresholds.high, true);
+  try {
+    if (configChar.writeValueWithResponse) await configChar.writeValueWithResponse(buf);
+    else await configChar.writeValue(buf);
+    if (!quiet) { msg.textContent = 'Sent to strap.'; msg.className = 'ok'; }
+  } catch (err) {
+    msg.textContent = 'Couldn’t send to strap: ' + err.message;
+    msg.className = 'err';
+  }
+}
+
+function fillThresholdInputs() {
+  $('thHr').value = thresholds.hr;
+  $('thLow').value = thresholds.low;
+  $('thHigh').value = thresholds.high;
+}
+
+$('saveThresholds').addEventListener('click', async () => {
+  const t = readThresholdInputs();
+  if (t.error) { $('configMsg').textContent = t.error; $('configMsg').className = 'err'; return; }
+  thresholds = t;
+  save('thresholds', thresholds);
+  if (demo) demo.thresholds = thresholds;
+  await sendThresholds(false);
+  renderAll();
+});
+
+// =====================================================================
+// Screen wake lock (where supported)
+// =====================================================================
+let wakeLock = null;
+async function requestWakeLock() {
+  try { if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen'); } catch {}
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && (connected || demo)) requestWakeLock();
+});
+
+// =====================================================================
+// Demo mode -- simulated packets, including the firmware's hold-time logic
+// =====================================================================
+let demo = null;
+function startDemo() {
+  unlockAudio();
+  const timers = { hr: 0, low: 0, high: 0 };
+  demo = { t: 0, thresholds, timer: null };
+  demo.timer = setInterval(() => {
+    const t = demo.t++;
+    const hr = Math.round(150 + 25 * Math.sin(t / 40) + (Math.random() - .5) * 4);
+    const cad = t % 120 < 10 ? 0 : Math.round(180 + 30 * Math.sin(t / 25) + (Math.random() - .5) * 4);
+    const th = demo.thresholds;
+    timers.hr   = hr > th.hr ? timers.hr + 1 : 0;
+    timers.low  = cad > 0 && cad < th.low ? timers.low + 1 : 0;
+    timers.high = cad > th.high ? timers.high + 1 : 0;
+    const mask = (timers.hr >= HOLD_HR_S ? BIT_HR : 0)
+               | (timers.low >= HOLD_CAD_S ? BIT_LOW_CAD : 0)
+               | (timers.high >= HOLD_CAD_S ? BIT_HIGH_CAD : 0);
+    handleSample({ deviceMs: t * 1000, hr, cad, mask });
+  }, 1000);
+  setStatus('Demo', 'warn');
+  requestWakeLock();
+}
+function stopDemo() {
+  if (!demo) return;
+  clearInterval(demo.timer);
+  demo = null;
+  setStatus(connected ? 'Connected' : 'Not connected', connected ? 'ok' : '');
+}
+
+// =====================================================================
+// CSV export
+// =====================================================================
+async function exportCsv() {
+  if (!samples.length) { alert('No data recorded yet.'); return; }
+  const rows = ['iso_time,elapsed_s,device_ms,hr_bpm,cadence_spm,alert_mask'];
+  for (const s of samples) {
+    rows.push([new Date(s.t).toISOString(), ((s.t - sessionStart) / 1000).toFixed(1),
+               s.deviceMs, s.hr, s.cad, s.mask].join(','));
+  }
+  const name = `t452-run-${new Date(sessionStart).toISOString().slice(0, 16).replace(/[:T]/g, '-')}.csv`;
+  const file = new File([rows.join('\n')], name, { type: 'text/csv' });
+  try {
+    if (navigator.canShare && navigator.canShare({ files: [file] })) {
+      await navigator.share({ files: [file], title: name });
+      return;
+    }
+  } catch (err) { if (err.name === 'AbortError') return; }
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(file);
+  a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+}
+
+// =====================================================================
+// Wiring
+// =====================================================================
+$('connectBtn').addEventListener('click', connect);
+$('disconnectBtn').addEventListener('click', disconnect);
+$('exportBtn').addEventListener('click', exportCsv);
+$('optVoice').checked = opts.voice;
+$('optBeep').checked = opts.beep;
+$('optVoice').addEventListener('change', (e) => { opts.voice = e.target.checked; save('voice', opts.voice); unlockAudio(); });
+$('optBeep').addEventListener('change', (e) => { opts.beep = e.target.checked; save('beep', opts.beep); unlockAudio(); });
+$('optDemo').addEventListener('change', (e) => {
+  if (e.target.checked) {
+    if (connected) { e.target.checked = false; alert('Disconnect from the strap first.'); return; }
+    startDemo();
+  } else stopDemo();
+});
+
+fillThresholdInputs();
+window.addEventListener('resize', renderCharts);
+// Tick once a second so the timer, "stale" state and chart scroll keep moving
+// even if packets stop arriving.
+setInterval(() => { renderLatest(); renderStats(); renderCharts(); }, 1000);
+renderAll();
+</script>
+</body>
+</html>
